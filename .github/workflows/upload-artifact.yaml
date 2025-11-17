@@ -81,6 +81,8 @@ on:
         required: true
       AWS_SECRET_ACCESS_KEY:
         required: true
+      JWT_SECRET:
+        required: false
     outputs:
       artifact_url:
         description: "S3 URL of the deployed artifact"
@@ -135,6 +137,8 @@ jobs:
       # 4. BUILD APPLICATION
       # ==========================================
       - name: Build application
+        env:
+            JWT_SECRET: ${{ secrets.JWT_SECRET }}
         run: |
           echo "Building ${{ inputs.app_name }}..."
           ${{ inputs.build_command }}
