@@ -157,6 +157,7 @@ jobs:
           cp -r ${{ inputs.artifact_path }} deployment/
           cp package.json deployment/
           cp package-lock.json deployment/
+          cp public deployment/ || true
 
           # Create artifact metadata
           cat > deployment/ARTIFACT_INFO.txt <<EOF
