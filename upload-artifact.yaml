@@ -1,0 +1,326 @@
+name: Reusable Backend Deployment to AWS
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: string
+      version_tag:
+        description: 'Version tag (e.g., v1.2.3)'
+        required: false
+        type: string
+        default: 'latest'
+      aws_region:
+        description: 'AWS Region'
+        required: false
+        type: string
+        default: 'us-east-1'
+      node_version:
+        description: 'Node.js version'
+        required: false
+        type: string
+        default: '20.x'
+      app_name:
+        description: 'Application name'
+        required: true
+        type: string
+      build_command:
+        description: 'Build command to execute'
+        required: false
+        type: string
+        default: 'npm run build'
+      artifact_path:
+        description: 'Path to built artifacts (e.g., dist, build)'
+        required: false
+        type: string
+        default: 'dist'
+      s3_artifact_prefix:
+        description: 'S3 prefix for artifacts (e.g., backend, frontend)'
+        required: false
+        type: string
+        default: 'backend'
+      asg_suffix:
+        description: 'ASG name suffix (e.g., application-asg, api-asg)'
+        required: false
+        type: string
+        default: 'application-asg'
+      working_directory:
+        description: 'Working directory for the app'
+        required: false
+        type: string
+        default: '.'
+      health_check_path:
+        description: 'Health check endpoint path'
+        required: false
+        type: string
+        default: '/health'
+      log_path:
+        description: 'Application log path'
+        required: false
+        type: string
+        default: '/var/log/app/'
+      install_command:
+        description: 'Install dependencies command'
+        required: false
+        type: string
+        default: 'npm ci'
+      min_healthy_percentage:
+        description: 'Minimum healthy percentage during refresh'
+        required: false
+        type: number
+        default: 50
+      instance_warmup:
+        description: 'Instance warmup time in seconds'
+        required: false
+        type: number
+        default: 300
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+    outputs:
+      artifact_url:
+        description: "S3 URL of the deployed artifact"
+        value: ${{ jobs.build-and-deploy.outputs.artifact_url }}
+      refresh_id:
+        description: "Instance refresh ID"
+        value: ${{ jobs.build-and-deploy.outputs.refresh_id }}
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy ${{ inputs.app_name }}
+    runs-on: ubuntu-latest
+
+    outputs:
+      artifact_url: ${{ steps.upload.outputs.artifact_url }}
+      refresh_id: ${{ steps.refresh.outputs.refresh_id }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      # ==========================================
+      # 1. CHECKOUT CODE
+      # ==========================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # 2. SETUP NODE.JS
+      # ==========================================
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: 'npm'
+          cache-dependency-path: ${{ inputs.working_directory }}/package-lock.json
+
+      # ==========================================
+      # 3. INSTALL DEPENDENCIES
+      # ==========================================
+      - name: Install dependencies
+        run: |
+          echo "Installing dependencies for ${{ inputs.app_name }}..."
+          ${{ inputs.install_command }}
+
+      # ==========================================
+      # 4. BUILD APPLICATION
+      # ==========================================
+      - name: Build application
+        run: |
+          echo "Building ${{ inputs.app_name }}..."
+          ${{ inputs.build_command }}
+
+          echo "Build completed successfully!"
+          ls -la ${{ inputs.artifact_path }}/
+          
+      # ==========================================
+      # 5. PREPARE DEPLOYMENT ARTIFACT
+      # ==========================================
+      - name: Prepare deployment artifact
+        run: |
+          echo "Preparing deployment artifact..."
+
+          mkdir -p deployment
+          cp -r ${{ inputs.artifact_path }} deployment/
+          cp package.json deployment/
+          cp package-lock.json deployment/
+
+          # Create artifact metadata
+          cat > deployment/ARTIFACT_INFO.txt <<EOF
+          Application:   ${{ inputs.app_name }}
+          Environment:   ${{ inputs.environment }}
+          Build Date:    $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Git Commit:    ${{ github.sha }}
+          Git Branch:    ${{ github.ref_name }}
+          Version:       ${{ inputs.version_tag }}
+          Workflow:      ${{ github.workflow }}
+          Run Number:    ${{ github.run_number }}
+          AWS Region:    ${{ inputs.aws_region }}
+          EOF
+
+          # Create the ZIP file
+          cd deployment
+          zip -r ../app.zip . -x "*.git*" "node_modules/*"
+          cd ..
+
+          # Show artifact info
+          echo "Artifact created:"
+          ls -lh app.zip
+          unzip -l app.zip | head -20
+
+      # ==========================================
+      # 6. CONFIGURE AWS CREDENTIALS
+      # ==========================================
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
+
+      # ==========================================
+      # 7. GET AWS ACCOUNT ID
+      # ==========================================
+      - name: Get AWS Account ID
+        id: aws
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=${ACCOUNT_ID}" >> $GITHUB_OUTPUT
+          echo "AWS Account ID: ${ACCOUNT_ID}"
+
+      # ==========================================
+      # 8. UPLOAD ARTIFACT TO S3
+      # ==========================================
+      - name: Upload artifact to S3
+        id: upload
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          ACCOUNT_ID: ${{ steps.aws.outputs.account_id }}
+          VERSION_TAG: ${{ inputs.version_tag }}
+          S3_PREFIX: ${{ inputs.s3_artifact_prefix }}
+        run: |
+          S3_BUCKET="artifacts-${ENVIRONMENT}-${ACCOUNT_ID}"
+
+          echo "Uploading ${{ inputs.app_name }} to S3 bucket: ${S3_BUCKET}"
+
+          # Upload to versioned path
+          if [ "${VERSION_TAG}" != "latest" ]; then
+            S3_VERSION_PATH="s3://${S3_BUCKET}/${S3_PREFIX}/${VERSION_TAG}/app.zip"
+            echo "Uploading versioned artifact to: ${S3_VERSION_PATH}"
+            aws s3 cp app.zip "${S3_VERSION_PATH}" \
+              --metadata "app-name=${{ inputs.app_name }},git-commit=${{ github.sha }},build-date=$(date -u +%Y-%m-%d),version=${VERSION_TAG}"
+          fi
+
+          # Always upload to latest
+          S3_LATEST_PATH="s3://${S3_BUCKET}/${S3_PREFIX}/latest/app.zip"
+          echo "Uploading to latest: ${S3_LATEST_PATH}"
+          aws s3 cp app.zip "${S3_LATEST_PATH}" \
+            --metadata "app-name=${{ inputs.app_name }},git-commit=${{ github.sha }},build-date=$(date -u +%Y-%m-%d),version=${VERSION_TAG}"
+
+          echo "✓ Artifact uploaded successfully!"
+
+          # Verify upload
+          echo "Verifying upload..."
+          aws s3 ls "${S3_LATEST_PATH}"
+
+          # Output artifact URL
+          echo "artifact_url=${S3_LATEST_PATH}" >> $GITHUB_OUTPUT
+
+      # ==========================================
+      # 9. TRIGGER AUTO SCALING GROUP REFRESH
+      # ==========================================
+      - name: Trigger Auto Scaling Group refresh
+        id: refresh
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          ASG_SUFFIX: ${{ inputs.asg_suffix }}
+        run: |
+          ASG_NAME="${ENVIRONMENT}-${ASG_SUFFIX}"
+
+          echo "Triggering instance refresh for ASG: ${ASG_NAME}"
+
+          # Check if ASG exists
+          if aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "${ASG_NAME}" \
+              --query 'AutoScalingGroups[0].AutoScalingGroupName' \
+              --output text 2>/dev/null | grep -q "${ASG_NAME}"; then
+
+            # Start instance refresh
+            REFRESH_ID=$(aws autoscaling start-instance-refresh \
+              --auto-scaling-group-name "${ASG_NAME}" \
+              --preferences '{
+                "MinHealthyPercentage": ${{ inputs.min_healthy_percentage }},
+                "InstanceWarmup": ${{ inputs.instance_warmup }},
+                "CheckpointPercentages": [50, 100],
+                "CheckpointDelay": 300
+              }' \
+              --query 'InstanceRefreshId' \
+              --output text)
+
+            echo "Instance refresh started with ID: ${REFRESH_ID}"
+            echo "refresh_id=${REFRESH_ID}" >> $GITHUB_OUTPUT
+
+            echo ""
+            echo "========================================"
+            echo "Instance refresh initiated successfully!"
+            echo "ASG: ${ASG_NAME}"
+            echo "Refresh ID: ${REFRESH_ID}"
+            echo "========================================"
+            echo ""
+            echo "Monitor progress with:"
+            echo "aws autoscaling describe-instance-refreshes \\"
+            echo "  --auto-scaling-group-name ${ASG_NAME} \\"
+            echo "  --instance-refresh-ids ${REFRESH_ID}"
+
+          else
+            echo "WARNING: ASG '${ASG_NAME}' not found. Skipping instance refresh."
+            echo "The new artifact is uploaded to S3 and will be used for new instances."
+            echo "refresh_id=none" >> $GITHUB_OUTPUT
+          fi
+
+      # ==========================================
+      # 10. DEPLOYMENT SUMMARY
+      # ==========================================
+      - name: Deployment summary
+        if: always()
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          VERSION_TAG: ${{ inputs.version_tag }}
+          ACCOUNT_ID: ${{ steps.aws.outputs.account_id }}
+          S3_PREFIX: ${{ inputs.s3_artifact_prefix }}
+          ASG_SUFFIX: ${{ inputs.asg_suffix }}
+        run: |
+          echo ""
+          echo "╔════════════════════════════════════════════════════════════╗"
+          echo "║           DEPLOYMENT SUMMARY                               ║"
+          echo "╚════════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "Application:       ${{ inputs.app_name }}"
+          echo "Environment:       ${ENVIRONMENT}"
+          echo "Version:           ${VERSION_TAG}"
+          echo "Git Commit:        ${{ github.sha }}"
+          echo "Git Branch:        ${{ github.ref_name }}"
+          echo ""
+          echo "S3 Bucket:         artifacts-${ENVIRONMENT}-${ACCOUNT_ID}"
+          echo "S3 Path (latest):  ${S3_PREFIX}/latest/app.zip"
+          if [ "${VERSION_TAG}" != "latest" ]; then
+            echo "S3 Path (version): ${S3_PREFIX}/${VERSION_TAG}/app.zip"
+          fi
+          echo ""
+          echo "ASG Name:          ${ENVIRONMENT}-${ASG_SUFFIX}"
+          echo "Region:            ${{ inputs.aws_region }}"
+          echo ""
+          echo "Next steps:"
+          echo "1. Monitor instance refresh in AWS Console"
+          echo "2. Check application logs: ${{ inputs.log_path }}"
+          echo "3. Verify health: http://<alb-dns>${{ inputs.health_check_path }}"
+          echo ""
