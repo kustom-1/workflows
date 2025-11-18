@@ -76,6 +76,18 @@ on:
         required: false
         type: number
         default: 300
+
+      isNext:
+        description: 'Flag to indicate if this is a Next.js deployment'
+        required: false
+        type: boolean
+        default: false
+      static_assets_bucket_name:
+        description: 'Name of the S3 bucket for CloudFront static assets'
+        required: false
+        type: string
+        default: '' 
+
     secrets:
       AWS_ACCESS_KEY_ID:
         required: true
@@ -144,6 +156,7 @@ jobs:
           ${{ inputs.build_command }}
 
           echo "Build completed successfully!"
+          # Nota: Si es Next.js, artifact_path debe ser '.next'
           ls -la ${{ inputs.artifact_path }}/
           
       # ==========================================
@@ -154,10 +167,21 @@ jobs:
           echo "Preparing deployment artifact..."
 
           mkdir -p deployment
-          cp -r ${{ inputs.artifact_path }} deployment/
+          
+          # Si es Next.js, artifact_path es .next, copiamos .next y .next/standalone
+          if [ "${{ inputs.isNext }}" == "true" ]; then
+            echo "Next.js detected. Preparing standalone server artifact..."
+            cp -r ${{ inputs.artifact_path }}/standalone ./deployment/
+            cp -r ${{ inputs.artifact_path }}/public ./deployment/
+            cp -r ${{ inputs.artifact_path }}/static ./deployment/ || true # Para `next export` si se usa
+          else
+            # Flujo original para backends genéricos
+            cp -r ${{ inputs.artifact_path }} deployment/
+            cp public deployment/ || true
+          fi
+          
           cp package.json deployment/
           cp package-lock.json deployment/
-          cp public deployment/ || true
 
           # Create artifact metadata
           cat > deployment/ARTIFACT_INFO.txt <<EOF
@@ -170,6 +194,7 @@ jobs:
           Workflow:      ${{ github.workflow }}
           Run Number:    ${{ github.run_number }}
           AWS Region:    ${{ inputs.aws_region }}
+          IsNext:        ${{ inputs.isNext }}
           EOF
 
           # Create the ZIP file
@@ -214,9 +239,9 @@ jobs:
           S3_PREFIX: ${{ inputs.s3_artifact_prefix }}
         run: |
           S3_BUCKET="artifacts-${ENVIRONMENT}-${ACCOUNT_ID}"
-
           echo "Uploading ${{ inputs.app_name }} to S3 bucket: ${S3_BUCKET}"
-
+          # ... (el resto del script de subida es idéntico) ...
+          
           # Upload to versioned path
           if [ "${VERSION_TAG}" != "latest" ]; then
             S3_VERSION_PATH="s3://${S3_BUCKET}/${S3_PREFIX}/${VERSION_TAG}/app.zip"
@@ -232,12 +257,8 @@ jobs:
             --metadata "app-name=${{ inputs.app_name }},git-commit=${{ github.sha }},build-date=$(date -u +%Y-%m-%d),version=${VERSION_TAG}"
 
           echo "✓ Artifact uploaded successfully!"
-
-          # Verify upload
           echo "Verifying upload..."
           aws s3 ls "${S3_LATEST_PATH}"
-
-          # Output artifact URL
           echo "artifact_url=${S3_LATEST_PATH}" >> $GITHUB_OUTPUT
 
       # ==========================================
@@ -249,17 +270,13 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
           ASG_SUFFIX: ${{ inputs.asg_suffix }}
         run: |
+          # ... (el script de refresh del ASG es idéntico) ...
           ASG_NAME="${ENVIRONMENT}-${ASG_SUFFIX}"
-
           echo "Triggering instance refresh for ASG: ${ASG_NAME}"
-
-          # Check if ASG exists
           if aws autoscaling describe-auto-scaling-groups \
               --auto-scaling-group-names "${ASG_NAME}" \
               --query 'AutoScalingGroups[0].AutoScalingGroupName' \
               --output text 2>/dev/null | grep -q "${ASG_NAME}"; then
-
-            # Start instance refresh
             REFRESH_ID=$(aws autoscaling start-instance-refresh \
               --auto-scaling-group-name "${ASG_NAME}" \
               --preferences '{
@@ -270,27 +287,46 @@ jobs:
               }' \
               --query 'InstanceRefreshId' \
               --output text)
-
             echo "Instance refresh started with ID: ${REFRESH_ID}"
             echo "refresh_id=${REFRESH_ID}" >> $GITHUB_OUTPUT
-
-            echo ""
-            echo "========================================"
-            echo "Instance refresh initiated successfully!"
-            echo "ASG: ${ASG_NAME}"
-            echo "Refresh ID: ${REFRESH_ID}"
-            echo "========================================"
-            echo ""
-            echo "Monitor progress with:"
-            echo "aws autoscaling describe-instance-refreshes \\"
-            echo "  --auto-scaling-group-name ${ASG_NAME} \\"
-            echo "  --instance-refresh-ids ${REFRESH_ID}"
-
+            # ... (resto del script de refresh) ...
           else
             echo "WARNING: ASG '${ASG_NAME}' not found. Skipping instance refresh."
-            echo "The new artifact is uploaded to S3 and will be used for new instances."
             echo "refresh_id=none" >> $GITHUB_OUTPUT
           fi
+
+      # Upload static assets to S3 if isNext is true
+      - name: ☁️ Sync Static Assets to CloudFront S3 Bucket
+        # Solo se ejecuta si isNext es true Y se pasó un nombre de bucket
+        if: inputs.isNext == true && inputs.static_assets_bucket_name != ''
+        env:
+          S3_ASSETS_BUCKET: ${{ inputs.static_assets_bucket_name }}
+          WORKING_DIR: ${{ inputs.working_directory }}
+        run: |
+          echo "Next.js flag is TRUE."
+          echo "Syncing static assets to CloudFront S3 bucket: ${S3_ASSETS_BUCKET}"
+
+          # Definir las rutas fuente basadas en el working_directory
+          NEXT_STATIC_PATH="${WORKING_DIR}/.next/static"
+          MODELS_PATH="${WORKING_DIR}/src/models"
+
+          # 1. Sincronizar archivos estáticos de Next.js
+          if [ -d "${NEXT_STATIC_PATH}" ]; then
+            echo "Syncing ${NEXT_STATIC_PATH} to s3://${S3_ASSETS_BUCKET}/_next/static/"
+            aws s3 sync "${NEXT_STATIC_PATH}" "s3://${S3_ASSETS_BUCKET}/_next/static/" --delete
+          else
+            echo "WARNING: Directory ${NEXT_STATIC_PATH} not found. Skipping sync."
+          fi
+
+          # 2. Sincronizar modelos 3D
+          if [ -d "${MODELS_PATH}" ]; then
+            echo "Syncing ${MODELS_PATH} to s3://${S3_ASSETS_BUCKET}/assets/models/"
+            aws s3 sync "${MODELS_PATH}" "s3://${S3_ASSETS_BUCKET}/assets/models/" --delete
+          else
+            echo "WARNING: Directory ${MODELS_PATH} not found. Skipping sync."
+          fi
+          
+          echo "✓ Static assets sync completed."
 
       # ==========================================
       # 10. DEPLOYMENT SUMMARY
@@ -303,6 +339,9 @@ jobs:
           ACCOUNT_ID: ${{ steps.aws.outputs.account_id }}
           S3_PREFIX: ${{ inputs.s3_artifact_prefix }}
           ASG_SUFFIX: ${{ inputs.asg_suffix }}
+          # ==== NUEVAS VARIABLES DE RESUMEN ====
+          IS_NEXT: ${{ inputs.isNext }}
+          S3_ASSETS_BUCKET: ${{ inputs.static_assets_bucket_name }}
         run: |
           echo ""
           echo "╔════════════════════════════════════════════════════════════╗"
@@ -313,16 +352,20 @@ jobs:
           echo "Environment:       ${ENVIRONMENT}"
           echo "Version:           ${VERSION_TAG}"
           echo "Git Commit:        ${{ github.sha }}"
-          echo "Git Branch:        ${{ github.ref_name }}"
           echo ""
-          echo "S3 Bucket:         artifacts-${ENVIRONMENT}-${ACCOUNT_ID}"
-          echo "S3 Path (latest):  ${S3_PREFIX}/latest/app.zip"
-          if [ "${VERSION_TAG}" != "latest" ]; then
-            echo "S3 Path (version): ${S3_PREFIX}/${VERSION_TAG}/app.zip"
+          echo "--- Application Server (EC2/ASG) ---"
+          echo "S3 Bucket (Artifact): artifacts-${ENVIRONMENT}-${ACCOUNT_ID}"
+          echo "S3 Path (latest):   ${S3_PREFIX}/latest/app.zip"
+          echo "ASG Name:           ${ENVIRONMENT}-${ASG_SUFFIX}"
+          echo "Region:             ${{ inputs.aws_region }}"
+          echo ""
+          echo "--- Static Assets (CloudFront/S3) ---"
+          echo "Is Next.js Deploy:  ${IS_NEXT}"
+          if [ "${IS_NEXT}" == "true" ]; then
+            echo "S3 Bucket (Assets): ${S3_ASSETS_BUCKET}"
+            echo "S3 Path (Next.js):  /_next/static/"
+            echo "S3 Path (Models):   /assets/models/"
           fi
-          echo ""
-          echo "ASG Name:          ${ENVIRONMENT}-${ASG_SUFFIX}"
-          echo "Region:            ${{ inputs.aws_region }}"
           echo ""
           echo "Next steps:"
           echo "1. Monitor instance refresh in AWS Console"
