@@ -95,6 +95,7 @@ on:
         required: true
       JWT_SECRET:
         required: false
+    
     outputs:
       artifact_url:
         description: "S3 URL of the deployed artifact"
@@ -297,11 +298,22 @@ jobs:
 
       # Upload static assets to S3 if isNext is true
       - name: ☁️ Sync Static Assets to CloudFront S3 Bucket
-        # Solo se ejecuta si isNext es true Y se pasó un nombre de bucket
+        
+        # La condición ahora comprueba el PREFIJO
         if: inputs.isNext == true && inputs.static_assets_bucket_name != ''
+        
         env:
-          S3_ASSETS_BUCKET: ${{ inputs.static_assets_bucket_name }}
+          # Obtenemos las variables para construir el nombre
+          ENVIRONMENT: ${{ inputs.environment }}
+          ACCOUNT_ID: ${{ steps.aws.outputs.account_id }}
+          S3_BUCKET_PREFIX: ${{ inputs.static_assets_bucket_name }}
+
+          # ==== ¡AQUÍ ESTÁ LA MAGIA! ====
+          # Construimos el nombre del bucket dinámicamente
+          S3_ASSETS_BUCKET: "${{ inputs.static_assets_bucket_name }}-${{ inputs.environment }}-${{ steps.aws.outputs.account_id }}"
+          
           WORKING_DIR: ${{ inputs.working_directory }}
+        
         run: |
           echo "Next.js flag is TRUE."
           echo "Syncing static assets to CloudFront S3 bucket: ${S3_ASSETS_BUCKET}"
@@ -339,7 +351,6 @@ jobs:
           ACCOUNT_ID: ${{ steps.aws.outputs.account_id }}
           S3_PREFIX: ${{ inputs.s3_artifact_prefix }}
           ASG_SUFFIX: ${{ inputs.asg_suffix }}
-          # ==== NUEVAS VARIABLES DE RESUMEN ====
           IS_NEXT: ${{ inputs.isNext }}
           S3_ASSETS_BUCKET: ${{ inputs.static_assets_bucket_name }}
         run: |
