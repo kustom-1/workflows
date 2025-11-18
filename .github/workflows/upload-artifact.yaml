@@ -173,7 +173,7 @@ jobs:
           if [ "${{ inputs.isNext }}" == "true" ]; then
             echo "Next.js detected. Preparing standalone server artifact..."
             cp -r ${{ inputs.artifact_path }}/standalone ./deployment/
-            cp -r ${{ inputs.artifact_path }}/public ./deployment/
+            cp -r ${{ inputs.working_directory }}/public ./deployment/
             cp -r ${{ inputs.artifact_path }}/static ./deployment/ || true # Para `next export` si se usa
           else
             # Flujo original para backends genéricos
