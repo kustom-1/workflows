@@ -169,20 +169,13 @@ jobs:
 
           mkdir -p deployment
           
-          # Si es Next.js, artifact_path es .next, copiamos .next y .next/standalone
-          if [ "${{ inputs.isNext }}" == "true" ]; then
-            echo "Next.js detected. Preparing standalone server artifact..."
-            cp -r ${{ inputs.artifact_path }}/standalone ./deployment/
-            cp -r ${{ inputs.working_directory }}/public ./deployment/
-            cp -r ${{ inputs.artifact_path }}/static ./deployment/ || true # Para `next export` si se usa
-          else
-            # Flujo original para backends genéricos
-            cp -r ${{ inputs.artifact_path }} deployment/
-            cp public deployment/ || true
-          fi
-          
+          cp -r ${{ inputs.artifact_path }} deployment/
           cp package.json deployment/
           cp package-lock.json deployment/
+          cp public deployment/ || true 
+
+          echo "Checking .next structure:"
+          ls -la deployment/.next/ || echo ".next not found in deployment"
 
           # Create artifact metadata
           cat > deployment/ARTIFACT_INFO.txt <<EOF
